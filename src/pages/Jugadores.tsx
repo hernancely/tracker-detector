@@ -2,44 +2,21 @@ import { useState } from "react";
 import DashboardLayout from "@/components/DashboardLayout";
 import PlayerCard from "@/components/PlayerCard";
 import { getPlayers, createPlayer, addPlayer, deletePlayer } from "@/lib/playerStore";
-import { Player, Calificacion } from "@/types/player";
+import { Player } from "@/types/player";
 import { Search, UserPlus, X, Trash2 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 
 const POSITIONS = ["Delantero", "Mediocampista", "Defensa", "Portero", "Extremo"];
-const CALIFICACIONES: { value: Calificacion; label: string }[] = [
-  { value: "bueno",   label: "Bueno" },
-  { value: "promedio", label: "Promedio" },
-  { value: "bajo",    label: "Bajo" },
-];
-
-const CAL_COLORS: Record<Calificacion, string> = {
-  bueno:   "text-green-400",
-  promedio:"text-yellow-400",
-  bajo:    "text-red-400",
-};
-
-function CalBar({ value }: { value: Calificacion }) {
-  const fill = value === "bueno" ? 100 : value === "promedio" ? 55 : 20;
-  const color = value === "bueno" ? "bg-green-500" : value === "promedio" ? "bg-yellow-500" : "bg-red-500";
-  return (
-    <div className="mt-1.5 h-1.5 w-full rounded-full bg-surface">
-      <div className={`h-1.5 rounded-full ${color} transition-all duration-300`} style={{ width: `${fill}%` }} />
-    </div>
-  );
-}
 
 function CreatePlayerModal({ onClose, onCreate }: { onClose: () => void; onCreate: () => void }) {
   const [name, setName] = useState("");
   const [age, setAge] = useState("");
   const [position, setPosition] = useState(POSITIONS[0]);
-  const [fisica, setFisica] = useState<Calificacion>("promedio");
-  const [psicologica, setPsicologica] = useState<Calificacion>("promedio");
 
   function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (!name.trim() || !age) return;
-    addPlayer(createPlayer(name, position, parseInt(age, 10), { fisica, psicologica }));
+    addPlayer(createPlayer(name, position, parseInt(age, 10)));
     onCreate();
   }
 
@@ -73,58 +50,6 @@ function CreatePlayerModal({ onClose, onCreate }: { onClose: () => void; onCreat
               </select>
             </div>
           </div>
-
-          {/* Caracterización física */}
-          <div className="rounded-xl border border-border bg-surface/50 p-4 space-y-3">
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Caracterización</p>
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-xs font-medium text-foreground">Condición Física</label>
-                <span className={`text-xs font-semibold ${CAL_COLORS[fisica]}`}>
-                  {CALIFICACIONES.find(c => c.value === fisica)?.label}
-                </span>
-              </div>
-              <div className="flex gap-2">
-                {CALIFICACIONES.map(c => (
-                  <button key={c.value} type="button" onClick={() => setFisica(c.value)}
-                    className={`flex-1 py-1.5 rounded-lg text-xs font-medium border transition-all ${
-                      fisica === c.value
-                        ? c.value === "bueno" ? "bg-green-500/15 border-green-500/40 text-green-400"
-                          : c.value === "promedio" ? "bg-yellow-500/15 border-yellow-500/40 text-yellow-400"
-                          : "bg-red-500/15 border-red-500/40 text-red-400"
-                        : "border-border text-muted-foreground hover:border-primary/30"
-                    }`}>
-                    {c.label}
-                  </button>
-                ))}
-              </div>
-              <CalBar value={fisica} />
-            </div>
-            <div>
-              <div className="flex items-center justify-between mb-1">
-                <label className="text-xs font-medium text-foreground">Condición Psicológica</label>
-                <span className={`text-xs font-semibold ${CAL_COLORS[psicologica]}`}>
-                  {CALIFICACIONES.find(c => c.value === psicologica)?.label}
-                </span>
-              </div>
-              <div className="flex gap-2">
-                {CALIFICACIONES.map(c => (
-                  <button key={c.value} type="button" onClick={() => setPsicologica(c.value)}
-                    className={`flex-1 py-1.5 rounded-lg text-xs font-medium border transition-all ${
-                      psicologica === c.value
-                        ? c.value === "bueno" ? "bg-green-500/15 border-green-500/40 text-green-400"
-                          : c.value === "promedio" ? "bg-yellow-500/15 border-yellow-500/40 text-yellow-400"
-                          : "bg-red-500/15 border-red-500/40 text-red-400"
-                        : "border-border text-muted-foreground hover:border-primary/30"
-                    }`}>
-                    {c.label}
-                  </button>
-                ))}
-              </div>
-              <CalBar value={psicologica} />
-            </div>
-          </div>
-
           <button type="submit" className="w-full mt-2 rounded-lg bg-primary px-4 py-2.5 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors">
             Crear jugador
           </button>
