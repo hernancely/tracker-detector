@@ -15,7 +15,7 @@ import {
   Loader2, Upload, X, AlertCircle, CheckCircle, Eye, WifiOff, Server,
 } from "lucide-react";
 
-const POSE_SERVER = "http://localhost:8000";
+const POSE_SERVER = import.meta.env.VITE_POSE_SERVER_URL ?? "http://localhost:8000";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface PoseLandmark { x: number; y: number; z?: number; visibility?: number; }
