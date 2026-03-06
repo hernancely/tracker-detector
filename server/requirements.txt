@@ -1,0 +1,19 @@
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+opencv-python>=4.10.0
+numpy>=1.26.0
+mediapipe>=0.10.21
+
+# ── OpenPose (optional, replaces mediapipe for higher accuracy) ────────────────
+# pyopenpose is NOT on PyPI — it must be built from source.
+# Full guide: https://github.com/CMU-Perceptual-Computing-Lab/openpose/blob/master/doc/advanced/python_api.md
+#
+# Quick steps (Linux/Windows with CUDA):
+#   git clone https://github.com/CMU-Perceptual-Computing-Lab/openpose
+#   cd openpose && mkdir build && cd build
+#   cmake .. -DBUILD_PYTHON=ON -DUSE_CUDNN=OFF
+#   make -j$(nproc)
+#   cd python/openpose && pip install .
+#   # then place the downloaded models/ folder in server/models/
+#
+# If pyopenpose is not found, the server automatically falls back to mediapipe.
