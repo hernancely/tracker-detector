@@ -31,7 +31,7 @@ const SprintChart = ({ player }: SprintChartProps) => {
                   className="h-full rounded-full transition-all duration-700 ease-out"
                   style={{
                     width: `${pct}%`,
-                    background: "linear-gradient(90deg, hsl(84 81% 44%), hsl(142 71% 45%))",
+                    background: "linear-gradient(90deg, hsl(22 100% 38%), hsl(22 100% 55%))",
                   }}
                 />
               </div>
