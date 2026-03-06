@@ -3,6 +3,17 @@ import { computeFisica } from "./charRulesStore";
 
 const PLAYERS_KEY = "sprintlab_players";
 
+function generateId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    const v = c === "x" ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
 // ── CRUD ──────────────────────────────────────────────────────────────────────
 
 export function getPlayers(): Player[] {
@@ -27,7 +38,7 @@ export function createPlayer(
   const words = name.trim().split(/\s+/);
   const avatar = words.map(w => w[0]?.toUpperCase() ?? "").join("").slice(0, 2);
   return {
-    id: crypto.randomUUID(),
+    id: generateId(),
     name: name.trim(),
     age,
     position,
