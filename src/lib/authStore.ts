@@ -32,6 +32,17 @@ export interface AppUser {
 const USERS_KEY   = "sprintlab_users";
 const SESSION_KEY = "sprintlab_session";
 
+function generateId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = Math.random() * 16 | 0;
+    const v = c === "x" ? r : (r & 0x3 | 0x8);
+    return v.toString(16);
+  });
+}
+
 function hashPassword(password: string): string {
   // Simple deterministic hash for localStorage MVP (not for production)
   let h = 0;
@@ -58,7 +69,7 @@ function seed(): void {
   const users = getUsers();
   if (users.length > 0) return;
   const admin: AppUser = {
-    id:           crypto.randomUUID(),
+    id:           generateId(),
     username:     "admin",
     passwordHash: hashPassword("admin123"),
     name:         "Administrador",
@@ -88,7 +99,7 @@ export function createUser(
     return { ok: false, error: "El nombre de usuario ya existe" };
   }
   const user: AppUser = {
-    id:           crypto.randomUUID(),
+    id:           generateId(),
     username:     username.trim(),
     passwordHash: hashPassword(password),
     name:         name.trim(),
