@@ -97,7 +97,7 @@ Write-OK "Contenedores levantados"
 
 # ── 5. Verificación ───────────────────────────────────────────────────────────
 Write-Step "Verificando salud del servidor..."
-Start-Sleep -Seconds 3
+Start-Sleep -Seconds 8
 $health = Invoke-SSH "curl -s http://localhost:8000/health 2>&1"
 Write-Host "  $health"
 
