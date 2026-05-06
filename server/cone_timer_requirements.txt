@@ -1,0 +1,6 @@
+# cone_timer.py — dependencias
+opencv-python>=4.10.0
+numpy>=1.26.0
+
+# Opcional: detección de jugador con YOLOv8 (--player yolo)
+# ultralytics>=8.0.0

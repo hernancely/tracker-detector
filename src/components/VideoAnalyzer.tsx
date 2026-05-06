@@ -16,13 +16,42 @@ import {
 } from "lucide-react";
 
 const POSE_SERVER = import.meta.env.VITE_POSE_SERVER_URL ?? "http://localhost:8000";
+const CONE_STORAGE_KEY = "fa_cone";
+const LLM_CONE_KEY    = "fa_llm_cones";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 interface PoseLandmark { x: number; y: number; z?: number; visibility?: number; }
 interface PoseResult   { landmarks: PoseLandmark[][]; engine?: string; }
 
 type Phase = "server_check" | "ready" | "analyzing" | "complete" | "error";
-interface FrameCone { x: number; y: number; color: string; }
+interface FrameCone { x: number; y: number; topY?: number; color: string; w?: number; h?: number; conf?: number; }
+
+interface ConeConfig {
+  id: string;
+  label: string;
+  color: string;
+  hMin: number;
+  hMax: number;
+  sMin: number;
+  sMax?: number;
+  vMin: number;
+}
+
+const CONE_CONFIGS: ConeConfig[] = [
+  { id: "rosa",     label: "Rosa",     color: "#ec4899", hMin: 290, hMax: 348, sMin: 0.55, vMin: 0.40 },
+  { id: "naranja",  label: "Naranja",  color: "#f97316", hMin:  12, hMax:  38, sMin: 0.65, vMin: 0.50 },
+  { id: "verde",    label: "Verde",    color: "#4ade80", hMin: 105, hMax: 150, sMin: 0.70, vMin: 0.45 },
+  { id: "amarillo", label: "Amarillo", color: "#facc15", hMin:  50, hMax:  88, sMin: 0.60, vMin: 0.55 },
+  { id: "azul",     label: "Azul",     color: "#38bdf8", hMin: 182, hMax: 218, sMin: 0.50, vMin: 0.40 },
+  { id: "blanco",   label: "Blanco",   color: "#e2e8f0", hMin:   0, hMax: 360, sMin: 0.00, sMax: 0.15, vMin: 0.82 },
+];
+
+function matchesCone(h: number, s: number, v: number, cfg: ConeConfig): boolean {
+  if (v < cfg.vMin) return false;
+  if (cfg.sMax !== undefined) return s <= cfg.sMax;
+  if (s < cfg.sMin) return false;
+  return h >= cfg.hMin && h <= cfg.hMax;
+}
 
 export interface VideoAnalyzerProps {
   onResult?: (result: SprintData) => void;
@@ -61,40 +90,143 @@ function rgbToHsv(r: number, g: number, b: number) {
 }
 
 function clusterPoints(pts: { x: number; y: number }[], r: number) {
-  const cls: { x: number; y: number; n: number; sx: number; sy: number }[] = [];
+  const cls: {
+    x: number; y: number; n: number; sx: number; sy: number;
+    x0: number; x1: number; y0: number; y1: number;
+  }[] = [];
   for (const pt of pts) {
     let hit = false;
     for (const c of cls) {
       if (Math.hypot(pt.x - c.x, pt.y - c.y) < r) {
         c.sx += pt.x; c.sy += pt.y; c.n++;
         c.x = c.sx / c.n; c.y = c.sy / c.n;
+        if (pt.x < c.x0) c.x0 = pt.x; if (pt.x > c.x1) c.x1 = pt.x;
+        if (pt.y < c.y0) c.y0 = pt.y; if (pt.y > c.y1) c.y1 = pt.y;
         hit = true; break;
       }
     }
-    if (!hit) cls.push({ x: pt.x, y: pt.y, n: 1, sx: pt.x, sy: pt.y });
+    if (!hit) cls.push({ x: pt.x, y: pt.y, n: 1, sx: pt.x, sy: pt.y, x0: pt.x, x1: pt.x, y0: pt.y, y1: pt.y });
   }
   return cls.filter(c => c.n >= 2).sort((a, b) => a.x - b.x);
+}
+
+// Returns the ratio of average pixel-width in the bottom half vs top half of a cluster.
+// A cone (wide base → narrow top) gives ratio > 1. A horizontal rope gives ratio ≈ 1.
+function conicScore(
+  data: Uint8ClampedArray,
+  W: number,
+  cl: { x0: number; x1: number; y0: number; y1: number },
+  cone: ConeConfig,
+): number {
+  const rows: number[] = [];
+  for (let y = cl.y0; y <= cl.y1; y += 2) {
+    let cnt = 0;
+    for (let x = cl.x0; x <= cl.x1; x += 2) {
+      const i = (y * W + x) * 4;
+      const { h, s, v } = rgbToHsv(data[i], data[i + 1], data[i + 2]);
+      if (matchesCone(h, s, v, cone)) cnt++;
+    }
+    rows.push(cnt);
+  }
+  if (rows.length < 4) return 0;
+  const half        = Math.floor(rows.length / 2);
+  const topAvg      = (rows.slice(0, half).reduce((a, b) => a + b, 0) / half)      || 0.01;
+  const bottomAvg   = (rows.slice(half).reduce((a, b) => a + b, 0) / (rows.length - half)) || 0.01;
+  return bottomAvg / topAvg; // >1 means wider at bottom → cone shape
+}
+
+type PlayerBox = { x0: number; y0: number; x1: number; y1: number };
+
+function playerBoxFromPose(
+  landmarks: { x: number; y: number; visibility?: number }[],
+  W: number, H: number,
+  minVis = 0.05,
+): PlayerBox | null {
+  const vis = landmarks.filter(lm => (lm.visibility ?? 0) >= minVis);
+  if (vis.length < 3) return null;
+  return {
+    x0: Math.min(...vis.map(lm => lm.x)) * W,
+    x1: Math.max(...vis.map(lm => lm.x)) * W,
+    y0: Math.min(...vis.map(lm => lm.y)) * H,
+    y1: Math.max(...vis.map(lm => lm.y)) * H,
+  };
 }
 
 function detectConesInFrame(
   data: Uint8ClampedArray,
   W: number,
   H: number,
+  cone: ConeConfig,
+  kneeY: number | null,     // pixel Y of player's knees — cones only searched below this line
+  aspectMax  = 2.8,         // max width/height ratio for a valid cone cluster
+  minHPct    = 0.008,       // min cluster height as fraction of frame height
+  conicMin   = 1.2,         // min bottom/top width ratio (0 = disabled, >1 = cone-shaped)
+  playerBox: PlayerBox | null = null, // pixel-space bounding box of the player — excluded
 ): FrameCone[] {
+  // Search only below the knees: cones are flat discs on the ground,
+  // always below knee level. Fall back to the lower 45 % when knees aren't detected.
+  const y0 = kneeY != null ? Math.floor(kneeY) : Math.floor(H * 0.55);
+  const y1 = H;
+
+  // Expand player box by 3 % of frame to cover shoe edges / loose clothing
+  const pad = W * 0.03;
+  const px0 = playerBox ? playerBox.x0 - pad : -1;
+  const px1 = playerBox ? playerBox.x1 + pad :  0;
+  const py0 = playerBox ? playerBox.y0 - pad : -1;
+  const py1 = playerBox ? playerBox.y1 + pad :  0;
+
   const pts: { x: number; y: number }[] = [];
-  const startY = Math.floor(H * 0.75); // cones are on the ground, below the player's feet
-  for (let y = startY; y < H; y += 2) {
+  for (let y = y0; y < y1; y += 2)
     for (let x = 0; x < W; x += 2) {
+      if (playerBox && x >= px0 && x <= px1 && y >= py0 && y <= py1) continue;
       const i = (y * W + x) * 4;
       const { h, s, v } = rgbToHsv(data[i], data[i + 1], data[i + 2]);
-      // Purple/magenta OR orange cones
-      const isPurple = h >= 240 && h <= 345 && s > 0.25 && v > 0.15;
-      const isOrange = (h <= 35 || h >= 345) && s > 0.45 && v > 0.35;
-      if (isPurple || isOrange) pts.push({ x, y });
+      if (matchesCone(h, s, v, cone)) pts.push({ x, y });
     }
-  }
-  const clusters = clusterPoints(pts, Math.max(20, Math.floor(W * 0.02)));
-  return clusters.map(cl => ({ x: cl.x, y: cl.y, color: "#a855f7" }));
+
+  // Larger radius → nearby patches merge into one cluster instead of fragmenting.
+  const r = Math.max(30, Math.floor(W * 0.045));
+
+  // ── Size constraints based on the physical cone (~35 cm disc) ─────────────────
+  // At typical sprint-test distances a cone spans ≈1.5 %–10 % of frame width.
+  // Smaller = noise pixel; larger = clothing patch or grass area, not a cone.
+  const minW = W * 0.015;
+  const maxW = W * 0.12;
+  const minH = H * minHPct;
+  const maxH = H * 0.10;
+
+  // Scale minimum point count with expected cone area at this resolution (step-2 sampling).
+  const minPts = Math.max(6, Math.floor(minW * minH / 8));
+
+  const isCone = (c: ReturnType<typeof clusterPoints>[0]) => {
+    const cw = c.x1 - c.x0 + 1;
+    const ch = c.y1 - c.y0 + 1;
+    return (
+      c.n  >= minPts &&
+      cw   >= minW  &&
+      cw   <= maxW  &&
+      ch   >= minH  &&
+      ch   <= maxH  &&
+      cw / ch >= 0.45 &&
+      cw / ch <= aspectMax
+    );
+  };
+
+  const candidates = clusterPoints(pts, r).filter(isCone).sort((a, b) => b.n - a.n).slice(0, 6);
+
+  // Suppress horizontal line patterns (measuring ropes, field lines):
+  // if ≥3 clusters share the same Y band AND collectively span >30% of frame width → line, not cones.
+  const isPartOfHLine = (c: typeof candidates[0]) => {
+    const band = candidates.filter(o => Math.abs(o.y - c.y) <= H * 0.04);
+    if (band.length < 3) return false;
+    const xSpan = Math.max(...band.map(o => o.x1)) - Math.min(...band.map(o => o.x0));
+    return xSpan > W * 0.30;
+  };
+
+  return candidates
+    .filter(c => !isPartOfHLine(c))
+    .filter(c => conicMin <= 0 || conicScore(data, W, c, cone) >= conicMin)
+    .map(cl => ({ x: cl.x, y: cl.y, color: cone.color }));
 }
 
 function detectPlayerColorInFrame(
@@ -141,20 +273,49 @@ function seekTo(v: HTMLVideoElement, t: number): Promise<void> {
 }
 
 // ─── Server API ────────────────────────────────────────────────────────────────
-async function checkServer(): Promise<{ ok: boolean; engine: string; available: string[] }> {
+async function checkServer(): Promise<{ ok: boolean; engine: string; available: string[]; yoloCones: boolean }> {
   try {
     const res = await fetch(`${POSE_SERVER}/health`, {
       signal: AbortSignal.timeout(3000),
     });
-    if (!res.ok) return { ok: false, engine: "none", available: [] };
+    if (!res.ok) return { ok: false, engine: "none", available: [], yoloCones: false };
     const data = await res.json();
     return {
-      ok: true,
-      engine:    data.engine    ?? "unknown",
-      available: data.available ?? [data.engine].filter(Boolean),
+      ok:        true,
+      engine:    data.engine     ?? "unknown",
+      available: data.available  ?? [data.engine].filter(Boolean),
+      yoloCones: data.yolo_cones ?? false,
     };
   } catch {
-    return { ok: false, engine: "none", available: [] };
+    return { ok: false, engine: "none", available: [], yoloCones: false };
+  }
+}
+
+async function fetchConesYOLO(
+  canvas: HTMLCanvasElement,
+  conf = 0.35,
+): Promise<{ x: number; y: number; color: string }[]> {
+  try {
+    const base64 = canvas.toDataURL("image/jpeg", 0.80).split(",")[1];
+    const res = await fetch(`${POSE_SERVER}/detect-cones`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ image: base64, conf }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    if (!data.available) return [];
+    return (data.cones as { x: number; y: number; w: number; h: number; conf: number; label: string }[]).map(c => ({
+      x:     c.x,
+      y:     c.y,
+      w:     c.w,
+      h:     c.h,
+      conf:  c.conf,
+      color: "#facc15",
+    }));
+  } catch {
+    return [];
   }
 }
 
@@ -191,11 +352,99 @@ function drawDetection(
   currentTime: number,
   splitsRecorded: number,
   footX: number | null,
+  footY: number | null,
   isCrossing: boolean,
+  kneeY: number | null,
+  coneTracks: { x: number; y: number; seenCount: number; fired: boolean; firstSeen: number }[],
+  sampleFps: number,
+  currentFrame: number,
+  playerBox: PlayerBox | null = null,
 ) {
   ctx.drawImage(src, 0, 0, W, H);
   ctx.fillStyle = "rgba(0,0,0,0.15)";
   ctx.fillRect(0, 0, W, H);
+
+  // ── Cone search zone rectangle ────────────────────────────────────────────────
+  const zoneY = kneeY != null ? Math.floor(kneeY) : Math.floor(H * 0.55);
+  // Semi-transparent fill inside the search box
+  ctx.fillStyle = "rgba(250,204,21,0.10)";
+  ctx.fillRect(2, zoneY, W - 4, H - zoneY - 2);
+  // Bold rectangle border
+  ctx.strokeStyle = "rgba(250,204,21,0.90)";
+  ctx.lineWidth = 3;
+  ctx.setLineDash([]);
+  ctx.strokeRect(2, zoneY, W - 4, H - zoneY - 2);
+  // Label badge pinned to top-left corner of the box
+  const label = kneeY != null ? "🔍 zona conos (bajo rodilla)" : "🔍 zona conos (fallback)";
+  const lw = ctx.measureText(label).width + 20;
+  ctx.fillStyle = "rgba(250,204,21,0.92)";
+  roundRect(ctx, 2, zoneY, lw, 22, 0);
+  ctx.fill();
+  ctx.fillStyle = "#000";
+  ctx.font = "bold 11px Inter,sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(label, 10, zoneY + 15);
+
+  // ── Player bounding box ───────────────────────────────────────────────────────
+  if (playerBox) {
+    const pad = W * 0.01;
+    const bx = playerBox.x0 - pad, by = playerBox.y0 - pad;
+    const bw = (playerBox.x1 - playerBox.x0) + pad * 2;
+    const bh = (playerBox.y1 - playerBox.y0) + pad * 2;
+    // Solid cyan box
+    ctx.strokeStyle = "rgba(6,182,212,0.95)";
+    ctx.lineWidth = 2.5;
+    ctx.setLineDash([]);
+    ctx.strokeRect(bx, by, bw, bh);
+    // Corner brackets for sporty look
+    const cs = Math.min(bw, bh) * 0.15;
+    ctx.strokeStyle = "#06b6d4";
+    ctx.lineWidth = 3.5;
+    for (const [ox, oy, dx, dy] of [
+      [bx, by, 1, 1], [bx + bw, by, -1, 1],
+      [bx, by + bh, 1, -1], [bx + bw, by + bh, -1, -1],
+    ] as [number,number,number,number][]) {
+      ctx.beginPath();
+      ctx.moveTo(ox + dx * cs, oy);
+      ctx.lineTo(ox, oy);
+      ctx.lineTo(ox, oy + dy * cs);
+      ctx.stroke();
+    }
+    // Label badge
+    ctx.font = "bold 11px Inter,sans-serif";
+    const lbl = "Jugador";
+    const lw = ctx.measureText(lbl).width + 14;
+    ctx.fillStyle = "rgba(6,182,212,0.92)";
+    roundRect(ctx, bx, by - 20, lw, 20, 4);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "left";
+    ctx.fillText(lbl, bx + 7, by - 5);
+  }
+
+  // ── Cone track tick marks ─────────────────────────────────────────────────────
+  const CONFIRM_FRAMES = 4;
+  for (const tr of coneTracks) {
+    const px = tr.x * W;
+    const confirmed = tr.seenCount >= CONFIRM_FRAMES;
+    const aged      = (currentFrame - tr.firstSeen) >= sampleFps;
+    const color = tr.fired        ? "rgba(34,197,94,0.8)"   // green = fired/used
+                : (confirmed && aged) ? "rgba(251,191,36,0.9)"  // amber = ready to fire
+                : confirmed       ? "rgba(148,163,184,0.7)"  // grey = confirmed, too young
+                                  : "rgba(100,100,100,0.5)"; // dim = not yet confirmed
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = confirmed ? 2.5 : 1.5;
+    ctx.beginPath();
+    ctx.moveTo(px, H - 28);
+    ctx.lineTo(px, H - 4);
+    ctx.stroke();
+    // Small dot at top of tick
+    ctx.fillStyle = color;
+    ctx.beginPath();
+    ctx.arc(px, H - 28, 4, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
 
   if (isCrossing) {
     ctx.strokeStyle = "#22c55e";
@@ -203,7 +452,56 @@ function drawDetection(
     ctx.strokeRect(3, 3, W - 6, H - 6);
   }
 
-  _drawCones(ctx, cones, W);
+  // ── Detected cone markers ─────────────────────────────────────────────────────
+  for (const cone of cones) {
+    const r = Math.max(18, W * 0.022);
+    ctx.beginPath();
+    ctx.arc(cone.x, cone.y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = cone.color;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    // inner dot
+    ctx.beginPath();
+    ctx.arc(cone.x, cone.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = cone.color;
+    ctx.fill();
+  }
+
+  // ── Foot → cone proximity line ────────────────────────────────────────────────
+  const CONFIRM_FRAMES_VIZ = 4;
+  const PROX_VIZ = 0.16, PROX_Y_VIZ = 0.25;
+  if (footX !== null && footY !== null) {
+    const fx = footX * W, fy = footY * H;
+    let closestTr: typeof coneTracks[0] | null = null;
+    let closestD = Infinity;
+    for (const tr of coneTracks) {
+      if (tr.fired || tr.seenCount < CONFIRM_FRAMES_VIZ) continue;
+      const dx = Math.abs(footX - tr.x), dy = Math.abs(footY - tr.y);
+      if (dx < PROX_VIZ && dy < PROX_Y_VIZ) {
+        const d = Math.hypot(dx, dy);
+        if (d < closestD) { closestD = d; closestTr = tr; }
+      }
+    }
+    if (closestTr) {
+      const cx = closestTr.x * W, cy = closestTr.y * H;
+      const alpha = isCrossing ? 1.0 : 0.65;
+      ctx.strokeStyle = isCrossing ? `rgba(34,197,94,${alpha})` : `rgba(250,204,21,${alpha})`;
+      ctx.lineWidth = isCrossing ? 3 : 1.5;
+      ctx.setLineDash(isCrossing ? [] : [6, 4]);
+      ctx.beginPath();
+      ctx.moveTo(fx, fy);
+      ctx.lineTo(cx, cy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      // Pulse ring on the cone
+      ctx.beginPath();
+      ctx.arc(cx, cy, Math.max(26, W * 0.032), 0, Math.PI * 2);
+      ctx.strokeStyle = isCrossing ? "rgba(34,197,94,0.9)" : "rgba(250,204,21,0.7)";
+      ctx.lineWidth = isCrossing ? 4 : 2;
+      ctx.stroke();
+    }
+  }
+
   _drawSkeleton(ctx, pose, W, H, footX, isCrossing);
 
   ctx.fillStyle = "rgba(0,0,0,0.60)";
@@ -246,9 +544,77 @@ function drawOverlay(
   cones: FrameCone[],
   W: number,
   H: number,
+  kneeY: number | null = null,
+  playerBox: PlayerBox | null = null,
 ) {
   ctx.clearRect(0, 0, W, H);
-  _drawCones(ctx, cones, W);
+
+  // Player bounding box
+  if (playerBox) {
+    const pad = W * 0.01;
+    const bx = playerBox.x0 - pad, by = playerBox.y0 - pad;
+    const bw = (playerBox.x1 - playerBox.x0) + pad * 2;
+    const bh = (playerBox.y1 - playerBox.y0) + pad * 2;
+    ctx.strokeStyle = "rgba(6,182,212,0.90)";
+    ctx.lineWidth = 2;
+    ctx.setLineDash([]);
+    ctx.strokeRect(bx, by, bw, bh);
+    const cs = Math.min(bw, bh) * 0.15;
+    ctx.strokeStyle = "#06b6d4";
+    ctx.lineWidth = 3;
+    for (const [ox, oy, dx, dy] of [
+      [bx, by, 1, 1], [bx + bw, by, -1, 1],
+      [bx, by + bh, 1, -1], [bx + bw, by + bh, -1, -1],
+    ] as [number,number,number,number][]) {
+      ctx.beginPath();
+      ctx.moveTo(ox + dx * cs, oy);
+      ctx.lineTo(ox, oy);
+      ctx.lineTo(ox, oy + dy * cs);
+      ctx.stroke();
+    }
+    ctx.font = "bold 10px Inter,sans-serif";
+    const lbl = "Jugador";
+    const lw = ctx.measureText(lbl).width + 12;
+    ctx.fillStyle = "rgba(6,182,212,0.90)";
+    roundRect(ctx, bx, by - 18, lw, 18, 4);
+    ctx.fill();
+    ctx.fillStyle = "#fff";
+    ctx.textAlign = "left";
+    ctx.fillText(lbl, bx + 6, by - 4);
+  }
+
+  // Search zone rectangle
+  const zoneY = kneeY != null ? Math.floor(kneeY) : Math.floor(H * 0.55);
+  ctx.fillStyle = "rgba(250,204,21,0.08)";
+  ctx.fillRect(2, zoneY, W - 4, H - zoneY - 2);
+  ctx.strokeStyle = "rgba(250,204,21,0.85)";
+  ctx.lineWidth = 2;
+  ctx.setLineDash([]);
+  ctx.strokeRect(2, zoneY, W - 4, H - zoneY - 2);
+  const lbl = kneeY != null ? "🔍 zona conos (bajo rodilla)" : "🔍 zona conos (fallback)";
+  const lw = ctx.measureText(lbl).width + 16;
+  ctx.fillStyle = "rgba(250,204,21,0.88)";
+  roundRect(ctx, 2, zoneY, lw, 20, 0);
+  ctx.fill();
+  ctx.fillStyle = "#000";
+  ctx.font = "bold 10px Inter,sans-serif";
+  ctx.textAlign = "left";
+  ctx.fillText(lbl, 8, zoneY + 14);
+
+  // Cone markers
+  for (const cone of cones) {
+    const r = Math.max(18, W * 0.022);
+    ctx.beginPath();
+    ctx.arc(cone.x, cone.y, r, 0, Math.PI * 2);
+    ctx.strokeStyle = cone.color;
+    ctx.lineWidth = 3;
+    ctx.stroke();
+    ctx.beginPath();
+    ctx.arc(cone.x, cone.y, 4, 0, Math.PI * 2);
+    ctx.fillStyle = cone.color;
+    ctx.fill();
+  }
+
   _drawSkeleton(ctx, pose, W, H, null, false);
 
   ctx.fillStyle = "rgba(0,0,0,0.55)";
@@ -261,28 +627,6 @@ function drawOverlay(
 }
 
 // ─── Shared drawing helpers ───────────────────────────────────────────────────
-function _drawCones(ctx: CanvasRenderingContext2D, cones: FrameCone[], W: number) {
-  for (const cone of cones) {
-    ctx.save();
-    ctx.setLineDash([5, 5]);
-    ctx.strokeStyle = `${cone.color}66`;
-    ctx.lineWidth = 1.5;
-    ctx.beginPath();
-    ctx.moveTo(cone.x, 0);
-    ctx.lineTo(cone.x, cone.y - 24);
-    ctx.stroke();
-    ctx.restore();
-
-    ctx.beginPath();
-    ctx.arc(cone.x, cone.y, Math.max(14, W * 0.015), 0, Math.PI * 2);
-    ctx.strokeStyle = cone.color;
-    ctx.lineWidth = 3;
-    ctx.stroke();
-    ctx.fillStyle = `${cone.color}33`;
-    ctx.fill();
-  }
-}
-
 function _drawSkeleton(
   ctx: CanvasRenderingContext2D,
   pose: PoseResult | null,
@@ -371,12 +715,22 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
   const [serverEngine, setServerEngine] = useState("");
   const [availableEngines, setAvailableEngines] = useState<string[]>([]);
   const [selectedEngine, setSelectedEngine] = useState("");
+  const [yoloCones, setYoloCones] = useState(false);
+  const yoloConesRef = useRef(false);
   const [result, setResult]         = useState<SprintData | null>(null);
   const [error, setError]           = useState<string | null>(null);
   const [videoFile, setVideoFile]   = useState<File | null>(null);
   const [videoUrl, setVideoUrl]     = useState<string | null>(null);
   const [liveInfo, setLiveInfo]     = useState({ cones: 0, player: false, splits: 0 });
   const [liveSplits, setLiveSplits] = useState<number[]>([]);
+  const [selectedCone, setSelectedCone] = useState<string>(
+    () => localStorage.getItem(CONE_STORAGE_KEY) ?? "rosa"
+  );
+  const [useLLMCones, setUseLLMCones] = useState(
+    () => localStorage.getItem(LLM_CONE_KEY) === "1"
+  );
+  const [llmCalibStatus, setLlmCalibStatus] = useState<"idle"|"calibrating"|"ready"|"error">("idle");
+  const [llmConeCount, setLlmConeCount]     = useState(0);
 
   const canvasRef         = useRef<HTMLCanvasElement>(null);
   const videoRef          = useRef<HTMLVideoElement>(null);
@@ -388,6 +742,28 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
   const liveDetecting     = useRef(false);   // prevent concurrent live requests
   const shouldAutoAnalyze = useRef(false);
   const selectedEngineRef = useRef("");      // stable ref for callbacks
+  const selectedConeRef   = useRef<ConeConfig>(
+    CONE_CONFIGS.find(c => c.id === (localStorage.getItem(CONE_STORAGE_KEY) ?? "rosa")) ?? CONE_CONFIGS[0]
+  );
+  const liveFootYRef       = useRef<number | null>(null);
+  const liveKneeYRef       = useRef<number | null>(null);
+  const livePlayerBoxRef   = useRef<PlayerBox | null>(null);
+  const useLLMConesRef    = useRef(localStorage.getItem(LLM_CONE_KEY) === "1");
+
+  // ── Tunable analysis parameters (live refs so analyze() reads latest) ─────────
+  const [paramProx,      setParamProx]      = useState(0.16);
+  const [paramMinAge,    setParamMinAge]     = useState(1.0);   // seconds
+  const [paramAspect,    setParamAspect]     = useState(2.8);
+  const [paramPoseConf,  setParamPoseConf]   = useState(0.10);
+  const [paramMinH,      setParamMinH]       = useState(0.008); // % of H
+  const [paramConic,     setParamConic]      = useState(1.2);   // bottom/top ratio
+  const [showParams,     setShowParams]      = useState(false);
+  const proxRef      = useRef(0.16);
+  const minAgeRef    = useRef(1.0);
+  const aspectRef    = useRef(2.8);
+  const poseConfRef  = useRef(0.10);
+  const minHRef      = useRef(0.008);
+  const conicRef     = useRef(1.2);
 
   // ── Server health check ────────────────────────────────────────────────────
   useEffect(() => {
@@ -395,15 +771,17 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
     (async () => {
       setPhase("server_check");
       setStatusMsg("Conectando con servidor...");
-      const { ok, engine, available } = await checkServer();
+      const { ok, engine, available, yoloCones: yc } = await checkServer();
       if (cancelled) return;
       if (ok) {
         setServerEngine(engine);
         setAvailableEngines(available);
         setSelectedEngine(engine);
         selectedEngineRef.current = engine;
+        setYoloCones(yc);
+        yoloConesRef.current = yc;
         setPhase("ready");
-        setStatusMsg(`Servidor listo · ${engine}`);
+        setStatusMsg(`Servidor listo · ${engine}${yc ? " · YOLO conos ✓" : ""}`);
       } else {
         setPhase("error");
         setError("No se puede conectar con el servidor.");
@@ -420,7 +798,7 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
     setVideoFile(file);
     setResult(null); setError(null);
     setProgress(0); setLiveInfo({ cones: 0, player: false, splits: 0 });
-    shouldAutoAnalyze.current = true;
+    shouldAutoAnalyze.current = false; // user must press Analizar explicitly
     if (phase === "complete" || phase === "error") setPhase("ready");
   }, [videoUrl, phase]);
 
@@ -430,6 +808,22 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
     setError(null); setProgress(0); setLiveInfo({ cones: 0, player: false, splits: 0 });
     if (phase === "complete" || phase === "analyzing") setPhase("ready");
   }, [videoUrl, phase]);
+
+  const handleLLMToggle = useCallback(() => {
+    const next = !useLLMConesRef.current;
+    useLLMConesRef.current = next;
+    setUseLLMCones(next);
+    localStorage.setItem(LLM_CONE_KEY, next ? "1" : "0");
+    setLlmCalibStatus("idle");
+    setLlmConeCount(0);
+  }, []);
+
+  const handleConeSelect = useCallback((id: string) => {
+    const cfg = CONE_CONFIGS.find(c => c.id === id) ?? CONE_CONFIGS[0];
+    setSelectedCone(id);
+    selectedConeRef.current = cfg;
+    localStorage.setItem(CONE_STORAGE_KEY, id);
+  }, []);
 
   // ── Live detection loop ────────────────────────────────────────────────────
   const stopLiveLoop = useCallback(() => {
@@ -469,12 +863,29 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
           snap.getContext("2d")!.drawImage(liveCv, 0, 0);
 
           const imageData = cvCtx.getImageData(0, 0, W, H);
-          const cones = detectConesInFrame(imageData.data, W, H);
+          // Use previous frame's pose data to exclude player body from cone search
+          const cones = detectConesInFrame(
+            imageData.data, W, H, selectedConeRef.current,
+            liveKneeYRef.current, aspectRef.current, minHRef.current, conicRef.current,
+            livePlayerBoxRef.current,
+          );
 
           liveDetecting.current = true;
           fetchPose(snap, selectedEngineRef.current || undefined).then(pose => {
+            if (pose?.landmarks?.length) {
+              const lm = pose.landmarks[0];
+              const feet = [lm[27], lm[28], lm[31], lm[32]].filter(k => k && (k.visibility ?? 0) > 0.05);
+              if (feet.length > 0)
+                liveFootYRef.current = (feet.reduce((s, k) => s + k.y, 0) / feet.length) * H;
+              const knees = [lm[25], lm[26]].filter(k => k && (k.visibility ?? 0) > 0.05);
+              if (knees.length > 0)
+                liveKneeYRef.current = (knees.reduce((s, k) => s + k.y, 0) / knees.length) * H;
+              livePlayerBoxRef.current = playerBoxFromPose(lm, W, H);
+            } else {
+              livePlayerBoxRef.current = null;
+            }
             const outCtxNow = canvasRef.current?.getContext("2d");
-            if (outCtxNow) drawOverlay(outCtxNow, pose, cones, W, H);
+            if (outCtxNow) drawOverlay(outCtxNow, pose, cones, W, H, liveKneeYRef.current, livePlayerBoxRef.current);
             liveDetecting.current = false;
           }).catch(() => {
             liveDetecting.current = false;
@@ -514,8 +925,11 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
     setResult(null);
     setLiveSplits([]);
 
-    const DEBOUNCE = 0.50; // min seconds between consecutive crossings
-    const PROX     = 0.16; // foot must be within 16% of frame width from cone center
+    const DEBOUNCE = 0.50;
+    const PROX     = proxRef.current;
+    const ASPECT   = aspectRef.current;
+    const MIN_H_PCT = minHRef.current;
+    const POSE_CONF = poseConfRef.current;
 
     try {
       hidden.src = videoUrl;
@@ -541,12 +955,22 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
       let motionFrames      = 0; // consecutive frames where ankles differ in height (= running)
       let poseFrames        = 0; // consecutive frames with valid pose (fallback start counter)
       let startConeMarked   = false; // whether the starting cone has been ignored
+      let prevFootX: number | null = null; // foot X from previous frame for directional crossing
 
-      type ConeTrack = { x: number; lastSeen: number; fired: boolean };
+      // A track must be seen in this many consecutive frames before it can trigger a split.
+      // This eliminates false positives that appear briefly at the start of the scan.
+      const CONFIRM_FRAMES = 4;
+      type ConeTrack = { x: number; y: number; lastSeen: number; firstSeen: number; seenCount: number; fired: boolean };
       const coneTracks: ConeTrack[] = [];
 
       let angleSum    = { hip: 0, knee: 0, ankle: 0 };
       let angleSamples = 0;
+
+      // ── LLM cone tracking (populated dynamically as cones appear in frame) ──
+      const llmCones: { x: number; fired: boolean }[] = [];
+      let startLLMConeMarked = false;
+      const LLM_SAMPLE_EVERY = 10; // call Claude every 10 analysis frames
+      if (useLLMConesRef.current) setLlmCalibStatus("calibrating");
 
       setStatusMsg("Analizando con IA...");
 
@@ -556,22 +980,68 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
         hiddenCtx.drawImage(hidden, 0, 0, W, H);
 
         const imageData = hiddenCtx.getImageData(0, 0, W, H);
-        const cones     = detectConesInFrame(imageData.data, W, H);
 
-        // Send original frame to server — server can scale internally
+        // Get pose first so foot Y can center the cone search band
         const poseResult = await fetchPose(hiddenCv, selectedEngineRef.current || undefined);
 
         let footX: number | null = null;
+        let footY: number | null = null;
+        let kneeY:  number | null = null;
+        let playerBox: PlayerBox | null = null;
         let playerDetected = poseResult != null && poseResult.landmarks.length > 0;
 
         if (playerDetected) {
           const kps = poseResult!.landmarks[0];
-          // Use only ankles + toes: these are closest to the ground where the cone is
           const feet = [kps[27], kps[28], kps[31], kps[32]]
-            .filter(k => k && (k.visibility ?? 0) > 0.05);
+            .filter(k => k && (k.visibility ?? 0) > POSE_CONF);
           if (feet.length > 0) {
             footX = feet.reduce((s, k) => s + k.x, 0) / feet.length;
+            footY = feet.reduce((s, k) => s + k.y, 0) / feet.length;
           }
+          const knees = [kps[25], kps[26]].filter(k => k && (k.visibility ?? 0) > POSE_CONF);
+          if (knees.length > 0)
+            kneeY = (knees.reduce((s, k) => s + k.y, 0) / knees.length) * H;
+          playerBox = playerBoxFromPose(kps, W, H, POSE_CONF);
+        }
+
+        // ── LLM cone detection (periodic) ────────────────────────────────────
+        if (useLLMConesRef.current && f % LLM_SAMPLE_EVERY === 0 && crossings.length < 5) {
+          const b64 = hiddenCv.toDataURL("image/jpeg", 0.75).split(",")[1];
+          try {
+            const res = await fetch(`${POSE_SERVER}/calibrate-cones`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ frames: [b64] }),
+              signal: AbortSignal.timeout(15000),
+            });
+            if (res.ok) {
+              const data = await res.json();
+              for (const nx of (data.cones ?? []) as number[]) {
+                if (!llmCones.some(c => Math.abs(c.x - nx) < 0.05)) {
+                  llmCones.push({ x: nx, fired: false });
+                  llmCones.sort((a, b) => b.x - a.x); // right-to-left
+                }
+              }
+              if (llmCones.length > 0) {
+                setLlmConeCount(llmCones.length);
+                setLlmCalibStatus("ready");
+              }
+            }
+          } catch { /* keep going with current positions */ }
+        }
+
+        // Cone detection priority: YOLO (server) > LLM (periodic) > HSV (browser)
+        let cones: FrameCone[];
+        if (yoloConesRef.current) {
+          const yoloDets = await fetchConesYOLO(hiddenCv);
+          cones = yoloDets.map(c => ({ x: c.x * W, y: c.y * H, w: (c.w ?? 0) * W, h: (c.h ?? 0) * H, conf: c.conf, color: selectedConeRef.current.color }));
+        } else if (llmCones.length > 0) {
+          cones = llmCones.map(c => ({
+            x: c.x * W, y: H * 0.82,
+            color: c.fired ? "#22c55e" : selectedConeRef.current.color,
+          }));
+        } else {
+          cones = detectConesInFrame(imageData.data, W, H, selectedConeRef.current, kneeY, ASPECT, MIN_H_PCT, conicRef.current, playerBox);
         }
 
         // Color fallback: only marks player as detected (no footX, no startTime)
@@ -617,19 +1087,19 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
         }
 
         // Cone tracker — nearest-neighbour match across frames
-        const detNorms = cones.map(c => c.x / W);
+        const detNorms = cones.map(c => ({ x: c.x / W, y: c.y / H }));
         const matched  = new Set<number>();
         for (const tr of coneTracks) {
           let bestD = 0.18, bestI = -1;
           for (let i = 0; i < detNorms.length; i++) {
             if (matched.has(i)) continue;
-            const d = Math.abs(detNorms[i] - tr.x);
+            const d = Math.abs(detNorms[i].x - tr.x);
             if (d < bestD) { bestD = d; bestI = i; }
           }
-          if (bestI >= 0) { tr.x = detNorms[bestI]; tr.lastSeen = f; matched.add(bestI); }
+          if (bestI >= 0) { tr.x = detNorms[bestI].x; tr.y = detNorms[bestI].y; tr.lastSeen = f; tr.seenCount++; matched.add(bestI); }
         }
         for (let i = 0; i < detNorms.length; i++) {
-          if (!matched.has(i)) coneTracks.push({ x: detNorms[i], lastSeen: f, fired: false });
+          if (!matched.has(i)) coneTracks.push({ x: detNorms[i].x, y: detNorms[i].y, lastSeen: f, firstSeen: f, seenCount: 1, fired: false });
         }
         // Age out stale tracks (cone not seen for >8 s) — avoids phantom positions.
         // Use a long window: the last cone is often occluded by the player's body as they cross it.
@@ -639,43 +1109,67 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
 
         showCrossing = t < showCrossingUntil;
 
-        // On the first frame after the timer starts, mark the starting cone as fired so it
-        // doesn't count as a split. Use only PROX (not 1.5x) to avoid accidentally excluding
-        // the 10m cone if motion detection triggers a bit late.
-        if (!startConeMarked && startTime !== null && footX !== null) {
-          // Exclude only the single nearest cone to the player's foot at start
-          let nearestTr: typeof coneTracks[0] | null = null;
-          let nearestD = PROX;
-          for (const tr of coneTracks) {
-            if (tr.fired) continue;
-            const d = Math.abs(footX - tr.x);
-            if (d < nearestD) { nearestD = d; nearestTr = tr; }
+        if (llmCones.length > 0) {
+          // ── LLM cone crossing ─────────────────────────────────────────────
+          // Mark cone 0 (rightmost = start) as fired when timer begins
+          if (!startLLMConeMarked && startTime !== null) {
+            llmCones[0].fired = true;
+            startLLMConeMarked = true;
           }
-          if (nearestTr) nearestTr.fired = true;
-          startConeMarked = true;
-        }
-
-        // Proximity crossing: foot within PROX of cone X, respects DEBOUNCE between events.
-        // No stale-visibility check here: the player's body often blocks the cone at the moment
-        // of crossing, so we rely on the last known position and DEBOUNCE to avoid double-counts.
-        if (footX !== null && startTime !== null && crossings.length < 5) {
-          for (const tr of coneTracks) {
-            if (tr.fired) continue;
-            if (Math.abs(footX - tr.x) < PROX && (t - lastCrossingTime) > DEBOUNCE) {
+          if (footX !== null && startTime !== null && crossings.length < 5) {
+            // Sequential: only check the next unfired cone (R→L order)
+            const nextCone = llmCones.find(c => !c.fired);
+            if (nextCone && footX <= nextCone.x + PROX && (t - lastCrossingTime) > DEBOUNCE) {
               crossings.push(parseFloat((t - startTime).toFixed(2)));
               lastCrossingTime  = t;
               showCrossingUntil = t + 0.5;
               showCrossing      = true;
-              tr.fired          = true;
-              break;
+              nextCone.fired    = true;
             }
           }
+        } else {
+          // ── HSV track-based crossing ──────────────────────────────────────
+          // Mark start cone as fired (X-only nearest match, no age requirement).
+          if (!startConeMarked && startTime !== null && footX !== null) {
+            let nearestTr: typeof coneTracks[0] | null = null;
+            let nearestD = PROX;
+            for (const tr of coneTracks) {
+              if (tr.fired || tr.seenCount < CONFIRM_FRAMES) continue;
+              const d = Math.abs(footX - tr.x);
+              if (d < nearestD) { nearestD = d; nearestTr = tr; }
+            }
+            if (nearestTr) nearestTr.fired = true;
+            startConeMarked = true;
+          }
+
+          // Directional sweep: fire when foot X passes through a cone's X position
+          // between consecutive frames. This avoids false proximity triggers and the
+          // stale-Y problem — no Y check needed.
+          if (footX !== null && startTime !== null && crossings.length < 5) {
+            const lo = prevFootX !== null ? Math.min(prevFootX, footX) - 0.04
+                                          : footX - PROX;
+            const hi = prevFootX !== null ? Math.max(prevFootX, footX) + 0.04
+                                          : footX + PROX;
+            for (const tr of coneTracks) {
+              if (tr.fired || tr.seenCount < CONFIRM_FRAMES) continue;
+              if (tr.x >= lo && tr.x <= hi && (t - lastCrossingTime) > DEBOUNCE) {
+                crossings.push(parseFloat((t - startTime).toFixed(2)));
+                lastCrossingTime  = t;
+                showCrossingUntil = t + 0.5;
+                showCrossing      = true;
+                tr.fired          = true;
+                break;
+              }
+            }
+          }
+          prevFootX = footX ?? prevFootX;
         }
 
         drawDetection(
           outCtx, hiddenCv, poseResult, cones,
           W, H, t - (startTime ?? t),
-          crossings.length, footX, showCrossing,
+          crossings.length, footX, footY, showCrossing,
+          kneeY, coneTracks, sampleFps, f, playerBox,
         );
 
         if (f % 3 === 0) {
@@ -699,6 +1193,7 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
       const base = crossings.length >= 5 ? crossings.slice(1, 5) : crossings.slice(0, 4);
       const sprintResult: SprintData = {
         t10: base[0], t20: base[1], t30: base[2], t40: base[3],
+        reaction:   startTime != null ? parseFloat(startTime.toFixed(2)) : undefined,
         hipAngle:   angleSamples > 0 ? Math.round(angleSum.hip   / angleSamples) : undefined,
         kneeAngle:  angleSamples > 0 ? Math.round(angleSum.knee  / angleSamples) : undefined,
         ankleAngle: angleSamples > 0 ? Math.round(angleSum.ankle / angleSamples) : undefined,
@@ -726,6 +1221,7 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
   }, [videoUrl, phase, analyze]);
 
   const isAnalyzing = phase === "analyzing";
+  const selectedConeConfig = CONE_CONFIGS.find(c => c.id === selectedCone) ?? CONE_CONFIGS[0];
 
   return (
     <div className="space-y-5">
@@ -759,14 +1255,16 @@ python main.py`}</pre>
             onClick={async () => {
               setPhase("server_check");
               setError(null);
-              const { ok, engine, available } = await checkServer();
+              const { ok, engine, available, yoloCones: yc } = await checkServer();
               if (ok) {
                 setServerEngine(engine);
                 setAvailableEngines(available);
                 setSelectedEngine(engine);
                 selectedEngineRef.current = engine;
+                setYoloCones(yc);
+                yoloConesRef.current = yc;
                 setPhase("ready");
-                setStatusMsg(`Servidor listo · ${engine}`);
+                setStatusMsg(`Servidor listo · ${engine}${yc ? " · YOLO conos ✓" : ""}`);
               } else {
                 setPhase("error");
                 setError("Servidor aún no disponible.");
@@ -824,8 +1322,54 @@ python main.py`}</pre>
               ))}
             </div>
           )}
+          {/* Cone color selector */}
+          <div
+            className="flex items-center justify-center gap-3 mb-3"
+            onClick={e => e.stopPropagation()}
+          >
+            <span className="text-xs text-muted-foreground shrink-0">Cono:</span>
+            {CONE_CONFIGS.map(cfg => (
+              <button
+                key={cfg.id}
+                title={cfg.label}
+                onClick={() => handleConeSelect(cfg.id)}
+                className="flex flex-col items-center gap-0.5"
+              >
+                <span
+                  className={`block h-6 w-6 rounded-full border-2 transition-all ${
+                    selectedCone === cfg.id
+                      ? "border-foreground scale-110 shadow"
+                      : "border-border hover:border-foreground/50"
+                  }`}
+                  style={{ background: cfg.color }}
+                />
+                <span className={`text-[9px] leading-none ${selectedCone === cfg.id ? "text-foreground font-medium" : "text-muted-foreground"}`}>
+                  {cfg.label}
+                </span>
+              </button>
+            ))}
+          </div>
+
+          {/* LLM cone detection toggle */}
+          <div className="flex items-center justify-center gap-2 mb-4" onClick={e => e.stopPropagation()}>
+            <button
+              onClick={handleLLMToggle}
+              className={`flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                useLLMCones
+                  ? "bg-primary/15 text-primary border-primary/50"
+                  : "bg-surface text-muted-foreground border-border hover:border-primary/30"
+              }`}
+            >
+              <span>🤖</span>
+              <span>Detección IA (Claude)</span>
+              {useLLMCones && <span className="h-1.5 w-1.5 rounded-full bg-primary animate-pulse" />}
+            </button>
+            {useLLMCones && (
+              <span className="text-[10px] text-muted-foreground">Claude calibra los conos al inicio</span>
+            )}
+          </div>
           <div className="inline-flex flex-col gap-1 text-xs text-muted-foreground bg-surface rounded-lg px-4 py-2.5 text-left">
-            <span>• Conos <strong className="text-foreground">morados</strong> en 0m, 10m, 20m, 30m, 40m</span>
+            <span>• Conos <strong className="text-foreground">{selectedConeConfig.label.toLowerCase()}</strong> en 0m, 10m, 20m, 30m, 40m</span>
             <span>• Funciona con cámara <strong className="text-foreground">fija o móvil</strong></span>
             <span>• Jugador como <strong className="text-foreground">único objeto en movimiento</strong></span>
           </div>
@@ -866,9 +1410,19 @@ python main.py`}</pre>
                   </div>
                   <div className="text-muted-foreground">Jugador</div>
                 </div>
-                <div className={`rounded-lg border p-2.5 text-center transition-colors ${liveInfo.cones > 0 ? "border-purple-500/40 bg-purple-500/10" : "border-border bg-surface/40"}`}>
-                  <div className={`font-bold mb-0.5 ${liveInfo.cones > 0 ? "text-purple-400" : "text-muted-foreground"}`}>
-                    {liveInfo.cones}
+                <div className={`rounded-lg border p-2.5 text-center transition-colors ${
+                  llmCalibStatus === "calibrating" ? "border-primary/40 bg-primary/10" :
+                  llmCalibStatus === "ready"       ? "border-green-500/40 bg-green-500/10" :
+                  liveInfo.cones > 0               ? "border-purple-500/40 bg-purple-500/10"
+                                                   : "border-border bg-surface/40"}`}>
+                  <div className={`font-bold mb-0.5 text-xs ${
+                    llmCalibStatus === "calibrating" ? "text-primary animate-pulse" :
+                    llmCalibStatus === "ready"       ? "text-green-400" :
+                    liveInfo.cones > 0               ? "text-purple-400"
+                                                     : "text-muted-foreground"}`}>
+                    {llmCalibStatus === "calibrating" ? "IA..." :
+                     llmCalibStatus === "ready"       ? `${llmConeCount} IA` :
+                     liveInfo.cones}
                   </div>
                   <div className="text-muted-foreground">Conos</div>
                 </div>
@@ -898,8 +1452,8 @@ python main.py`}</pre>
                       { label: "20 → 30m", idx: 2 },
                       { label: "30 → 40m", idx: 3 },
                     ].map(({ label, idx }) => {
-                      const t    = liveSplits[idx];
-                      const prev = idx > 0 ? liveSplits[idx - 1] : 0;
+                      const t       = liveSplits[idx];
+                      const prev    = idx > 0 ? liveSplits[idx - 1] : 0;
                       const partial = t !== undefined && prev !== undefined ? t - prev : undefined;
                       const recorded = t !== undefined;
                       return (
@@ -916,9 +1470,54 @@ python main.py`}</pre>
                         </tr>
                       );
                     })}
+                    {liveSplits.length === 4 && (
+                      <tr className="border-t border-border/50">
+                        <td className="pt-1.5 text-[10px] font-medium text-muted-foreground uppercase">Total</td>
+                        <td className="pt-1.5 text-right text-xs font-display font-bold text-foreground tabular-nums">
+                          {liveSplits[3].toFixed(2)}s
+                        </td>
+                        <td />
+                      </tr>
+                    )}
                   </tbody>
                 </table>
               </div>
+            </div>
+          )}
+
+          {/* Cone color selector + LLM toggle (compact) */}
+          {!isAnalyzing && (
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-xs text-muted-foreground shrink-0">Cono:</span>
+              {CONE_CONFIGS.map(cfg => (
+                <button
+                  key={cfg.id}
+                  title={cfg.label}
+                  onClick={() => handleConeSelect(cfg.id)}
+                  className={`h-5 w-5 rounded-full border-2 shrink-0 transition-all ${
+                    selectedCone === cfg.id
+                      ? "border-foreground scale-110"
+                      : "border-border hover:border-foreground/50"
+                  }`}
+                  style={{ background: cfg.color }}
+                />
+              ))}
+              <div className="h-4 w-px bg-border mx-1" />
+              <button
+                onClick={handleLLMToggle}
+                title="Usar Claude Vision para detectar conos"
+                className={`flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium border transition-colors ${
+                  useLLMCones
+                    ? "bg-primary/15 text-primary border-primary/50"
+                    : "bg-surface text-muted-foreground border-border hover:border-primary/30"
+                }`}
+              >
+                <span>🤖</span>
+                <span>IA</span>
+                {useLLMCones && llmCalibStatus === "ready" && (
+                  <span className="text-[9px] text-green-400">{llmConeCount} conos</span>
+                )}
+              </button>
             </div>
           )}
 
@@ -969,14 +1568,69 @@ python main.py`}</pre>
             </div>
           )}
 
-          {/* Re-analyze */}
-          {!isAnalyzing && (phase === "complete" || phase === "error") && (
-            <button
-              onClick={() => { setPhase("ready"); setResult(null); setError(null); setProgress(0); }}
-              className="w-full flex items-center justify-center gap-2 rounded-lg border border-border bg-surface py-2.5 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors"
-            >
-              Volver a analizar
-            </button>
+          {/* ── Parameter sliders + Analizar button (shown when not analyzing) ── */}
+          {!isAnalyzing && (
+            <div className="space-y-3">
+
+              {/* Collapsible params panel */}
+              <div className="rounded-lg border border-border bg-surface/60">
+                <button
+                  onClick={() => setShowParams(v => !v)}
+                  className="w-full flex items-center justify-between px-3 py-2 text-xs font-medium text-muted-foreground hover:text-foreground transition-colors"
+                >
+                  <span>⚙ Parámetros de detección</span>
+                  <span className="text-[10px]">{showParams ? "▲" : "▼"}</span>
+                </button>
+
+                {showParams && (
+                  <div className="px-3 pb-3 space-y-3 border-t border-border/50 pt-3">
+                    {(
+                      [
+                        { label: "Proximidad cruce",      key: "prox",     val: paramProx,     set: setParamProx,     ref: proxRef,     min: 0.04, max: 0.40, step: 0.01, fmt: (v: number) => `${Math.round(v*100)}%` },
+                        { label: "Edad mín. de track",    key: "minAge",   val: paramMinAge,   set: setParamMinAge,   ref: minAgeRef,   min: 0,    max: 3.0,  step: 0.25, fmt: (v: number) => `${v.toFixed(2)}s` },
+                        { label: "Ratio forma (anti-cuerda)", key: "aspect", val: paramAspect, set: setParamAspect,   ref: aspectRef,   min: 1.5,  max: 5.0,  step: 0.1,  fmt: (v: number) => `${v.toFixed(1)}` },
+                        { label: "Confianza pose",        key: "poseConf", val: paramPoseConf, set: setParamPoseConf, ref: poseConfRef, min: 0.01, max: 0.50, step: 0.01, fmt: (v: number) => `${v.toFixed(2)}` },
+                        { label: "Altura mín. cluster",   key: "minH",     val: paramMinH,     set: setParamMinH,     ref: minHRef,     min: 0.003,max: 0.03, step: 0.001,fmt: (v: number) => `${(v*100).toFixed(1)}%` },
+                        { label: "Forma cónica (ancho↓/↑)", key: "conic", val: paramConic,   set: setParamConic,   ref: conicRef,    min: 0,    max: 3.0,  step: 0.1,  fmt: (v: number) => v <= 0 ? "off" : `${v.toFixed(1)}x` },
+                      ] as const
+                    ).map(p => (
+                      <div key={p.key} className="space-y-1">
+                        <div className="flex justify-between text-[11px]">
+                          <span className="text-muted-foreground">{p.label}</span>
+                          <span className="font-mono text-foreground tabular-nums">{p.fmt(p.val)}</span>
+                        </div>
+                        <input
+                          type="range"
+                          min={p.min} max={p.max} step={p.step}
+                          value={p.val}
+                          onChange={e => {
+                            const v = parseFloat(e.target.value);
+                            p.set(v as never);
+                            (p.ref as React.MutableRefObject<number>).current = v;
+                          }}
+                          className="w-full h-1.5 accent-primary cursor-pointer"
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Primary action button */}
+              <button
+                onClick={() => {
+                  if (phase === "complete" || phase === "error") {
+                    setResult(null); setError(null); setProgress(0); setPhase("ready");
+                    setTimeout(() => analyze(), 0);
+                  } else {
+                    analyze();
+                  }
+                }}
+                className="w-full flex items-center justify-center gap-2 rounded-lg bg-primary py-3 text-sm font-semibold text-primary-foreground hover:bg-primary/90 transition-colors shadow-sm"
+              >
+                ▶ Analizar video
+              </button>
+            </div>
           )}
 
           {/* Analysis error */}
@@ -1000,6 +1654,20 @@ python main.py`}</pre>
             </span>
           </div>
 
+          {/* Reaction / explosive start */}
+          {result.reaction !== undefined && (
+            <div className="rounded-lg bg-amber-500/10 border border-amber-500/30 px-4 py-3 flex items-center justify-between">
+              <div>
+                <p className="text-xs font-medium text-amber-400 uppercase tracking-wider">Explosividad de arranque</p>
+                <p className="text-[10px] text-muted-foreground mt-0.5">Tiempo de reacción hasta primer movimiento</p>
+              </div>
+              <span className="font-display font-bold text-2xl tabular-nums text-amber-400">
+                {result.reaction.toFixed(2)}s
+              </span>
+            </div>
+          )}
+
+          {/* 4 splits */}
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border">
@@ -1024,6 +1692,11 @@ python main.py`}</pre>
                   </tr>
                 );
               })}
+              <tr className="border-t border-border">
+                <td className="pt-2.5 pl-0 text-xs font-medium text-muted-foreground uppercase">Total 40m</td>
+                <td className="pt-2.5 px-3 text-right font-display font-bold text-foreground tabular-nums">{result.t40.toFixed(2)}s</td>
+                <td />
+              </tr>
             </tbody>
           </table>
 
@@ -1062,7 +1735,7 @@ python main.py`}</pre>
               ["#ef4444", "Brazos"],
               ["#3b82f6", "Piernas / Pies"],
               ["#00ffcc", "Zona de tracking (pies)"],
-              ["#a855f7", "Cono morado"],
+              [selectedConeConfig.color, `Cono ${selectedConeConfig.label.toLowerCase()}`],
             ].map(([c, l]) => (
               <span key={l} className="flex items-center gap-1.5">
                 <span className="h-2.5 w-2.5 rounded-full shrink-0" style={{ background: c }} />

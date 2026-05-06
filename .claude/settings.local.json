@@ -6,7 +6,17 @@
       "Bash(npx vite:*)",
       "WebSearch",
       "Bash(npm install:*)",
-      "mcp__ide__getDiagnostics"
+      "mcp__ide__getDiagnostics",
+      "Bash(git push:*)",
+      "Bash(python main.py)",
+      "Bash(ssh -i \"C:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\fazes\" -o StrictHostKeyChecking=no fazes@179.1.87.46 \"cd /home/fazes/dashboard-new && git pull && docker compose build 2>&1\")",
+      "Bash(npx tsc *)",
+      "Bash(npm run *)",
+      "Bash(python prepare_dataset.py \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\tracking-detector\\\\40_METROS.mp4\" \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\tracking-detector\\\\TEST_40_MTS_JUAN_FELIPE_QUIÑONES.mp4\" --fps 2 --out dataset)",
+      "Bash(python autolabel.py --raw dataset/raw --preview)",
+      "Bash(python -c ' *)",
+      "Bash(pip install *)",
+      "Bash(copy \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\Dashboard\\\\server\\\\runs\\\\detect\\\\cone_training\\\\run1\\\\weights\\\\best.pt\" \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\Dashboard\\\\server\\\\cone_model.pt\")"
     ]
   }
 }

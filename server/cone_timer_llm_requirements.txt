@@ -1,0 +1,4 @@
+# cone_timer_llm.py — dependencias
+anthropic>=0.40.0
+opencv-python>=4.10.0
+numpy>=1.26.0

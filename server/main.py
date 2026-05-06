@@ -17,6 +17,7 @@ Run:
 from __future__ import annotations
 
 import base64
+import json
 import logging
 import os
 import urllib.request
@@ -109,6 +110,29 @@ _init_openpose()
 _init_mediapipe()
 _default_engine = next(iter(_engines), "none")
 logger.info(f"Default engine: {_default_engine}  |  Available: {list(_engines.keys())}")
+
+# ── YOLO Cone Detection ────────────────────────────────────────────────────────
+_yolo_model = None
+
+def _init_yolo() -> bool:
+    global _yolo_model
+    model_path = os.path.join(_DIR, "cone_model.pt")
+    if not os.path.exists(model_path):
+        logger.info("cone_model.pt not found — place your trained model at server/cone_model.pt to enable YOLO cone detection")
+        return False
+    try:
+        from ultralytics import YOLO  # type: ignore
+        _yolo_model = YOLO(model_path)
+        logger.info("✅ YOLO cone model loaded from cone_model.pt")
+        return True
+    except ImportError:
+        logger.warning("ultralytics not installed — run: pip install ultralytics")
+        return False
+    except Exception as exc:
+        logger.warning(f"YOLO model load failed → {exc}")
+        return False
+
+_init_yolo()
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
 app = FastAPI(title="SprintLab Pose Server", version="3.0.0")
@@ -210,7 +234,51 @@ def health():
         "status": "ok",
         "engine":    _default_engine,
         "available": list(_engines.keys()),
+        "yolo_cones": _yolo_model is not None,
     }
+
+
+# ── YOLO cone detection models ─────────────────────────────────────────────────
+class ConeDetectRequest(BaseModel):
+    image: str        # base64 JPEG
+    conf: float = 0.35
+
+class ConeDetection(BaseModel):
+    x: float    # center X normalized [0,1]
+    y: float    # center Y normalized [0,1]
+    w: float    # width normalized [0,1]
+    h: float    # height normalized [0,1]
+    conf: float
+    label: str
+
+class ConeDetectResponse(BaseModel):
+    cones:     List[ConeDetection]
+    available: bool
+
+
+@app.post("/detect-cones", response_model=ConeDetectResponse)
+def detect_cones(req: ConeDetectRequest):
+    """YOLO cone detection. Returns empty list with available=False if model not loaded."""
+    if _yolo_model is None:
+        return ConeDetectResponse(cones=[], available=False)
+    try:
+        img = _decode_image(req.image)
+        H, W = img.shape[:2]
+        results = _yolo_model.predict(img, conf=req.conf, verbose=False)[0]
+        cones = []
+        for box in results.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            cx   = (x1 + x2) / 2 / W
+            cy   = (y1 + y2) / 2 / H
+            bw   = (x2 - x1) / W
+            bh   = (y2 - y1) / H
+            conf = float(box.conf[0])
+            label = results.names[int(box.cls[0])]
+            cones.append(ConeDetection(x=cx, y=cy, w=bw, h=bh, conf=conf, label=label))
+        return ConeDetectResponse(cones=cones, available=True)
+    except Exception as exc:
+        logger.error(f"YOLO detection error: {exc}")
+        return ConeDetectResponse(cones=[], available=False)
 
 @app.get("/engines")
 def get_engines():
@@ -242,6 +310,138 @@ def detect(req: DetectRequest):
         lms = []
 
     return DetectResponse(landmarks=lms, engine=engine_name)
+
+
+# ── LLM Cone Calibration ───────────────────────────────────────────────────────
+
+_CALIB_SYSTEM = """\
+You are a sports video analyst for a sprint timing system.
+
+CONTEXT: A player runs from right to left on a grass field. Sprint cones (flat white
+discs, ~20-40 cm diameter) are placed on the ground. As the player advances, cones
+enter the frame one by one from the right. The player may be partially visible.
+
+WHAT TO FIND — white/light flat discs on the GRASS:
+- Small circular objects lying flat on the ground
+- Usually in the lower third of the frame (ground level)
+- IGNORE: field lines (thin/long), player clothing/shoes, sky, fences, shadows
+
+REPORT only cones that are CLEARLY VISIBLE in this frame.
+
+RESPOND with ONLY valid JSON (no markdown, no explanation):
+{
+  "cones_found": true,
+  "cone_x_normalized": [0.75, 0.42],
+  "confidence": 0.9
+}
+
+Rules:
+- cone_x_normalized: X positions normalized [0=left, 1=right], sorted right-to-left
+- Only include cones you can clearly see — do not guess occluded ones
+- confidence: 0.0-1.0
+- If none visible: cones_found=false, cone_x_normalized=[]
+"""
+
+
+def _cluster_1d(points: list, merge_dist: float) -> list:
+    if not points:
+        return []
+    pts = sorted(points, reverse=True)
+    clusters: list = [[pts[0]]]
+    for p in pts[1:]:
+        mean = sum(clusters[-1]) / len(clusters[-1])
+        if abs(p - mean) <= merge_dist:
+            clusters[-1].append(p)
+        else:
+            clusters.append([p])
+    return [sum(c) / len(c) for c in clusters]
+
+
+class CalibrateRequest(BaseModel):
+    frames: List[str]   # base64 JPEG images, max 15
+
+
+class CalibrateResponse(BaseModel):
+    cones:           List[float]       # normalized X [0,1], right-to-left
+    confidence:      float
+    frames_analyzed: int
+    error:           Optional[str] = None
+
+
+@app.post("/calibrate-cones", response_model=CalibrateResponse)
+def calibrate_cones(req: CalibrateRequest):
+    """Use Claude Vision to detect stable cone positions from calibration frames."""
+    try:
+        import anthropic as ant  # type: ignore
+    except ImportError:
+        raise HTTPException(503, detail="anthropic package not installed — run: pip install anthropic")
+
+    if not req.frames:
+        raise HTTPException(400, detail="No frames provided")
+
+    client = ant.Anthropic()   # reads ANTHROPIC_API_KEY from env
+    raw_xs: List[float] = []
+    analyzed = 0
+
+    for b64 in req.frames[:15]:
+        try:
+            response = client.messages.create(
+                model="claude-opus-4-7",
+                max_tokens=256,
+                system=[{
+                    "type": "text",
+                    "text": _CALIB_SYSTEM,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/jpeg",
+                                "data": b64,
+                            },
+                        },
+                        {"type": "text", "text": "Find white cones/discs on the grass. Return JSON only."},
+                    ],
+                }],
+            )
+            text = next((b.text for b in response.content if b.type == "text"), "").strip()
+            # Strip markdown fences if model adds them
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1] if "\n" in text else text[3:]
+                text = text.rsplit("```", 1)[0]
+            data = json.loads(text)
+            if data.get("cones_found") and data.get("cone_x_normalized"):
+                conf = float(data.get("confidence", 1.0))
+                if conf >= 0.4:
+                    raw_xs.extend(data["cone_x_normalized"])
+            analyzed += 1
+        except Exception as exc:
+            logger.warning(f"LLM frame analysis failed: {exc}")
+
+    if not raw_xs:
+        return CalibrateResponse(
+            cones=[], confidence=0.0, frames_analyzed=analyzed,
+            error="No cones detected in any frame"
+        )
+
+    clusters = _cluster_1d(raw_xs, 0.05)
+    min_count = max(2, analyzed // 4)
+    stable = [
+        cx for cx in clusters
+        if sum(1 for x in raw_xs if abs(x - cx) <= 0.05) >= min_count
+    ]
+    stable.sort(reverse=True)
+
+    logger.info(f"Cone calibration: {len(stable)} stable cones from {analyzed} frames")
+    return CalibrateResponse(
+        cones=stable,
+        confidence=0.85 if stable else 0.0,
+        frames_analyzed=analyzed,
+    )
 
 
 if __name__ == "__main__":

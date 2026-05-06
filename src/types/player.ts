@@ -3,6 +3,7 @@ export interface SprintData {
   t20: number;
   t30: number;
   t40: number;
+  reaction?: number;   // tiempo desde arranque hasta detección de primer movimiento (s)
   hipAngle?: number;
   kneeAngle?: number;
   ankleAngle?: number;

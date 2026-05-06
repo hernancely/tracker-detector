@@ -3,6 +3,8 @@ uvicorn[standard]>=0.32.0
 opencv-python>=4.10.0
 numpy>=1.26.0
 mediapipe>=0.10.21
+anthropic>=0.40.0
+ultralytics>=8.3.0
 
 # ── OpenPose (optional, replaces mediapipe for higher accuracy) ────────────────
 # pyopenpose is NOT on PyPI — it must be built from source.
