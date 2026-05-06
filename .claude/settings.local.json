@@ -18,7 +18,9 @@
       "Bash(pip install *)",
       "Bash(copy \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\Dashboard\\\\server\\\\runs\\\\detect\\\\cone_training\\\\run1\\\\weights\\\\best.pt\" \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\Dashboard\\\\server\\\\cone_model.pt\")",
       "Bash(ssh -i \"C:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\fazes\" -o StrictHostKeyChecking=no fazes@179.1.87.46 \"cd /home/fazes/dashboard-new && git pull && docker compose up -d backend 2>&1\")",
-      "Bash(ssh -i \"C:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\fazes\" -o StrictHostKeyChecking=no fazes@179.1.87.46 \"cd /home/fazes/dashboard-new && git checkout -- docker-compose.yml && git pull && docker compose up -d backend 2>&1\")"
+      "Bash(ssh -i \"C:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\fazes\" -o StrictHostKeyChecking=no fazes@179.1.87.46 \"cd /home/fazes/dashboard-new && git checkout -- docker-compose.yml && git pull && docker compose up -d backend 2>&1\")",
+      "Bash(ssh -i \"C:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\fazes\" -o StrictHostKeyChecking=no fazes@179.1.87.46 \"cd /home/fazes/dashboard-new && git pull && docker compose up -d 2>&1\")",
+      "Bash(ssh -i \"C:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\fazes\" -o StrictHostKeyChecking=no fazes@179.1.87.46 \"curl -s -o /dev/null -w '%{http_code}' http://localhost:8081 && curl -s http://localhost:8000/health 2>&1\")"
     ]
   }
 }
