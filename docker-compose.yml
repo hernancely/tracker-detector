@@ -6,6 +6,8 @@ services:
     restart: unless-stopped
     ports:
       - "8000:8000"
+    volumes:
+      - ./server/cone_model.pt:/app/cone_model.pt:ro
 
   frontend:
     build:
