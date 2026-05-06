@@ -359,6 +359,7 @@ function drawDetection(
   sampleFps: number,
   currentFrame: number,
   playerBox: PlayerBox | null = null,
+  angles?: { hip: number | null; knee: number | null; ankle: number | null },
 ) {
   ctx.drawImage(src, 0, 0, W, H);
   ctx.fillStyle = "rgba(0,0,0,0.15)";
@@ -454,17 +455,61 @@ function drawDetection(
 
   // ── Detected cone markers ─────────────────────────────────────────────────────
   for (const cone of cones) {
-    const r = Math.max(18, W * 0.022);
-    ctx.beginPath();
-    ctx.arc(cone.x, cone.y, r, 0, Math.PI * 2);
-    ctx.strokeStyle = cone.color;
-    ctx.lineWidth = 3;
-    ctx.stroke();
-    // inner dot
-    ctx.beginPath();
-    ctx.arc(cone.x, cone.y, 4, 0, Math.PI * 2);
-    ctx.fillStyle = cone.color;
-    ctx.fill();
+    if (cone.w && cone.h && cone.w > 0 && cone.h > 0) {
+      // YOLO detection — draw bounding rectangle
+      const rx = cone.x - cone.w / 2, ry = cone.y - cone.h / 2;
+      ctx.strokeStyle = cone.color;
+      ctx.lineWidth = 2.5;
+      ctx.setLineDash([]);
+      ctx.strokeRect(rx, ry, cone.w, cone.h);
+      // Corner accents
+      const cs = Math.min(cone.w, cone.h) * 0.25;
+      ctx.lineWidth = 3.5;
+      for (const [ox, oy, dx, dy] of [
+        [rx, ry, 1, 1], [rx + cone.w, ry, -1, 1],
+        [rx, ry + cone.h, 1, -1], [rx + cone.w, ry + cone.h, -1, -1],
+      ] as [number,number,number,number][]) {
+        ctx.beginPath();
+        ctx.moveTo(ox + dx * cs, oy);
+        ctx.lineTo(ox, oy);
+        ctx.lineTo(ox, oy + dy * cs);
+        ctx.stroke();
+      }
+      // Center dot
+      ctx.beginPath();
+      ctx.arc(cone.x, cone.y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = cone.color;
+      ctx.fill();
+      // Label badge
+      ctx.font = "bold 9px Inter,sans-serif";
+      const confStr = cone.conf != null ? ` ${Math.round(cone.conf * 100)}%` : "";
+      const lbl = `Cono${confStr}`;
+      const lw = ctx.measureText(lbl).width + 10;
+      ctx.fillStyle = cone.color;
+      ctx.globalAlpha = 0.85;
+      roundRect(ctx, rx, ry - 17, lw, 17, 3);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+      ctx.fillStyle = "#000";
+      ctx.textAlign = "left";
+      ctx.fillText(lbl, rx + 5, ry - 4);
+    } else {
+      // HSV detection — circle marker with label
+      const r = Math.max(18, W * 0.022);
+      ctx.beginPath();
+      ctx.arc(cone.x, cone.y, r, 0, Math.PI * 2);
+      ctx.strokeStyle = cone.color;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cone.x, cone.y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = cone.color;
+      ctx.fill();
+      ctx.font = "bold 9px Inter,sans-serif";
+      ctx.fillStyle = cone.color;
+      ctx.textAlign = "center";
+      ctx.fillText("Cono", cone.x, cone.y - r - 4);
+    }
   }
 
   // ── Foot → cone proximity line ────────────────────────────────────────────────
@@ -502,7 +547,7 @@ function drawDetection(
     }
   }
 
-  _drawSkeleton(ctx, pose, W, H, footX, isCrossing);
+  _drawSkeleton(ctx, pose, W, H, footX, isCrossing, angles);
 
   ctx.fillStyle = "rgba(0,0,0,0.60)";
   roundRect(ctx, 10, 10, 160, 48, 8);
@@ -603,16 +648,48 @@ function drawOverlay(
 
   // Cone markers
   for (const cone of cones) {
-    const r = Math.max(18, W * 0.022);
-    ctx.beginPath();
-    ctx.arc(cone.x, cone.y, r, 0, Math.PI * 2);
-    ctx.strokeStyle = cone.color;
-    ctx.lineWidth = 3;
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.arc(cone.x, cone.y, 4, 0, Math.PI * 2);
-    ctx.fillStyle = cone.color;
-    ctx.fill();
+    if (cone.w && cone.h && cone.w > 0 && cone.h > 0) {
+      const rx = cone.x - cone.w / 2, ry = cone.y - cone.h / 2;
+      ctx.strokeStyle = cone.color;
+      ctx.lineWidth = 2;
+      ctx.setLineDash([]);
+      ctx.strokeRect(rx, ry, cone.w, cone.h);
+      const cs = Math.min(cone.w, cone.h) * 0.25;
+      ctx.lineWidth = 3;
+      for (const [ox, oy, dx, dy] of [
+        [rx, ry, 1, 1], [rx + cone.w, ry, -1, 1],
+        [rx, ry + cone.h, 1, -1], [rx + cone.w, ry + cone.h, -1, -1],
+      ] as [number,number,number,number][]) {
+        ctx.beginPath();
+        ctx.moveTo(ox + dx * cs, oy);
+        ctx.lineTo(ox, oy);
+        ctx.lineTo(ox, oy + dy * cs);
+        ctx.stroke();
+      }
+      ctx.beginPath();
+      ctx.arc(cone.x, cone.y, 3, 0, Math.PI * 2);
+      ctx.fillStyle = cone.color;
+      ctx.fill();
+      ctx.font = "bold 9px Inter,sans-serif";
+      ctx.fillStyle = cone.color;
+      ctx.textAlign = "center";
+      ctx.fillText("Cono", cone.x, ry - 4);
+    } else {
+      const r = Math.max(18, W * 0.022);
+      ctx.beginPath();
+      ctx.arc(cone.x, cone.y, r, 0, Math.PI * 2);
+      ctx.strokeStyle = cone.color;
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(cone.x, cone.y, 4, 0, Math.PI * 2);
+      ctx.fillStyle = cone.color;
+      ctx.fill();
+      ctx.font = "bold 9px Inter,sans-serif";
+      ctx.fillStyle = cone.color;
+      ctx.textAlign = "center";
+      ctx.fillText("Cono", cone.x, cone.y - Math.max(18, W * 0.022) - 4);
+    }
   }
 
   _drawSkeleton(ctx, pose, W, H, null, false);
@@ -627,6 +704,23 @@ function drawOverlay(
 }
 
 // ─── Shared drawing helpers ───────────────────────────────────────────────────
+function _angleBadge(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number,
+  label: string,
+  value: number,
+) {
+  const text = `${label} ${Math.round(value)}°`;
+  ctx.font = "bold 10px Inter,sans-serif";
+  const tw = ctx.measureText(text).width + 10;
+  ctx.fillStyle = "rgba(0,0,0,0.72)";
+  roundRect(ctx, x - tw / 2, y - 9, tw, 17, 4);
+  ctx.fill();
+  ctx.fillStyle = "#fde68a";
+  ctx.textAlign = "center";
+  ctx.fillText(text, x, y + 5);
+}
+
 function _drawSkeleton(
   ctx: CanvasRenderingContext2D,
   pose: PoseResult | null,
@@ -634,6 +728,7 @@ function _drawSkeleton(
   H: number,
   footX: number | null,
   isCrossing: boolean,
+  angles?: { hip: number | null; knee: number | null; ankle: number | null },
 ) {
   if (!pose || pose.landmarks.length === 0) return;
   const lms = pose.landmarks[0];
@@ -690,6 +785,37 @@ function _drawSkeleton(
     ctx.moveTo(cx, 0); ctx.lineTo(cx, H);
     ctx.stroke();
     ctx.setLineDash([]);
+  }
+
+  // Joint angle badges
+  if (angles) {
+    // Hip: midpoint of lm[23] and lm[24]
+    if (angles.hip != null) {
+      const lh = [lms[23], lms[24]].filter(l => l && (l.visibility ?? 0) > 0.10);
+      if (lh.length > 0) {
+        const mx = (lh.reduce((s, l) => s + l.x, 0) / lh.length) * W;
+        const my = (lh.reduce((s, l) => s + l.y, 0) / lh.length) * H - 16;
+        _angleBadge(ctx, mx, my, "Cadera", angles.hip);
+      }
+    }
+    // Knee: midpoint of lm[25] and lm[26]
+    if (angles.knee != null) {
+      const lk = [lms[25], lms[26]].filter(l => l && (l.visibility ?? 0) > 0.10);
+      if (lk.length > 0) {
+        const mx = (lk.reduce((s, l) => s + l.x, 0) / lk.length) * W;
+        const my = (lk.reduce((s, l) => s + l.y, 0) / lk.length) * H;
+        _angleBadge(ctx, mx + 28, my, "Rodilla", angles.knee);
+      }
+    }
+    // Ankle: midpoint of lm[27] and lm[28]
+    if (angles.ankle != null) {
+      const la = [lms[27], lms[28]].filter(l => l && (l.visibility ?? 0) > 0.10);
+      if (la.length > 0) {
+        const mx = (la.reduce((s, l) => s + l.x, 0) / la.length) * W;
+        const my = (la.reduce((s, l) => s + l.y, 0) / la.length) * H + 16;
+        _angleBadge(ctx, mx + 28, my, "Tobillo", angles.ankle);
+      }
+    }
   }
 }
 
@@ -954,7 +1080,6 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
       let showCrossingUntil = -1;
       let motionFrames      = 0; // consecutive frames where ankles differ in height (= running)
       let poseFrames        = 0; // consecutive frames with valid pose (fallback start counter)
-      let startConeMarked   = false; // whether the starting cone has been ignored
       let prevFootX: number | null = null; // foot X from previous frame for directional crossing
 
       // A track must be seen in this many consecutive frames before it can trigger a split.
@@ -1069,7 +1194,8 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
           }
         }
 
-        // Accumulate joint angles
+        // Compute per-frame joint angles (for live overlay) and accumulate for final average
+        let frameAngles: { hip: number | null; knee: number | null; ankle: number | null } = { hip: null, knee: null, ankle: null };
         if (poseResult?.landmarks?.length) {
           const lm = poseResult.landmarks[0];
           const v = (i: number) => (lm[i]?.visibility ?? 0) > 0.10;
@@ -1080,9 +1206,9 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
           if (v(24)&&v(26)&&v(28)) { ka += angleDeg(lm[24].x,lm[24].y,lm[26].x,lm[26].y,lm[28].x,lm[28].y); kc++; }
           if (v(25)&&v(27)&&v(31)) { aa += angleDeg(lm[25].x,lm[25].y,lm[27].x,lm[27].y,lm[31].x,lm[31].y); ac++; }
           if (v(26)&&v(28)&&v(32)) { aa += angleDeg(lm[26].x,lm[26].y,lm[28].x,lm[28].y,lm[32].x,lm[32].y); ac++; }
-          if (hc) angleSum.hip   += ha / hc;
-          if (kc) angleSum.knee  += ka / kc;
-          if (ac) angleSum.ankle += aa / ac;
+          if (hc) { frameAngles.hip   = ha / hc; angleSum.hip   += ha / hc; }
+          if (kc) { frameAngles.knee  = ka / kc; angleSum.knee  += ka / kc; }
+          if (ac) { frameAngles.ankle = aa / ac; angleSum.ankle += aa / ac; }
           if (hc || kc || ac) angleSamples++;
         }
 
@@ -1128,24 +1254,12 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
             }
           }
         } else {
-          // ── HSV track-based crossing ──────────────────────────────────────
-          // Mark start cone as fired (X-only nearest match, no age requirement).
-          if (!startConeMarked && startTime !== null && footX !== null) {
-            let nearestTr: typeof coneTracks[0] | null = null;
-            let nearestD = PROX;
-            for (const tr of coneTracks) {
-              if (tr.fired || tr.seenCount < CONFIRM_FRAMES) continue;
-              const d = Math.abs(footX - tr.x);
-              if (d < nearestD) { nearestD = d; nearestTr = tr; }
-            }
-            if (nearestTr) nearestTr.fired = true;
-            startConeMarked = true;
-          }
-
-          // Directional sweep: fire when foot X passes through a cone's X position
-          // between consecutive frames. This avoids false proximity triggers and the
-          // stale-Y problem — no Y check needed.
-          if (footX !== null && startTime !== null && crossings.length < 5) {
+          // ── HSV / YOLO track-based crossing ───────────────────────────────
+          // Directional sweep: fire when foot X sweeps through a cone's X.
+          // First crossing is only valid after 1 s of running — this skips any
+          // cone at the start position without needing to identify which one it is.
+          if (footX !== null && startTime !== null && crossings.length < 5
+              && (t - startTime) >= 1.0) {
             const lo = prevFootX !== null ? Math.min(prevFootX, footX) - 0.04
                                           : footX - PROX;
             const hi = prevFootX !== null ? Math.max(prevFootX, footX) + 0.04
@@ -1169,7 +1283,7 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
           outCtx, hiddenCv, poseResult, cones,
           W, H, t - (startTime ?? t),
           crossings.length, footX, footY, showCrossing,
-          kneeY, coneTracks, sampleFps, f, playerBox,
+          kneeY, coneTracks, sampleFps, f, playerBox, frameAngles,
         );
 
         if (f % 3 === 0) {
