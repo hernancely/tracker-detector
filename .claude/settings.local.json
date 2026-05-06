@@ -16,7 +16,9 @@
       "Bash(python autolabel.py --raw dataset/raw --preview)",
       "Bash(python -c ' *)",
       "Bash(pip install *)",
-      "Bash(copy \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\Dashboard\\\\server\\\\runs\\\\detect\\\\cone_training\\\\run1\\\\weights\\\\best.pt\" \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\Dashboard\\\\server\\\\cone_model.pt\")"
+      "Bash(copy \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\Dashboard\\\\server\\\\runs\\\\detect\\\\cone_training\\\\run1\\\\weights\\\\best.pt\" \"c:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\Dashboard\\\\server\\\\cone_model.pt\")",
+      "Bash(ssh -i \"C:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\fazes\" -o StrictHostKeyChecking=no fazes@179.1.87.46 \"cd /home/fazes/dashboard-new && git pull && docker compose up -d backend 2>&1\")",
+      "Bash(ssh -i \"C:\\\\Users\\\\herna\\\\Documents\\\\Fazes\\\\fazes\" -o StrictHostKeyChecking=no fazes@179.1.87.46 \"cd /home/fazes/dashboard-new && git checkout -- docker-compose.yml && git pull && docker compose up -d backend 2>&1\")"
     ]
   }
 }

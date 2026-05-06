@@ -1064,6 +1064,16 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
         hidden.onerror = () => rej(new Error("No se pudo cargar el video."));
       });
 
+      // Many codecs (VBR MP4/H.264) report a preliminary duration at loadedmetadata.
+      // Seeking to a very large time forces the browser to buffer and resolve the real duration.
+      await new Promise<void>(res => {
+        const fn = () => { hidden.removeEventListener("seeked", fn); res(); };
+        hidden.addEventListener("seeked", fn);
+        hidden.currentTime = 1e101;
+      });
+      const trueDuration = isFinite(hidden.duration) ? hidden.duration : 0;
+      hidden.currentTime = 0;
+
       const W = hidden.videoWidth, H = hidden.videoHeight;
       hiddenCv.width = W; hiddenCv.height = H;
       outCv.width    = W; outCv.height    = H;
@@ -1071,7 +1081,7 @@ export function VideoAnalyzer({ onResult }: VideoAnalyzerProps) {
       const outCtx    = outCv.getContext("2d")!;
 
       const sampleFps   = 10;
-      const totalFrames = Math.floor(hidden.duration * sampleFps);
+      const totalFrames = Math.floor(trueDuration * sampleFps);
 
       const crossings: number[] = [];
       let lastCrossingTime  = -999;
