@@ -14,7 +14,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
-        VITE_POSE_SERVER_URL: "http://179.1.87.46:8000"
+        VITE_POSE_SERVER_URL: "https://dashboard.fazes.co/api"
     restart: unless-stopped
     ports:
       - "8081:80"
